@@ -1,0 +1,33 @@
+# Test Document for MarkItDown
+
+This is a simple test document to verify that our MarkItDown API is working correctly.
+
+## Features to Test
+
+1. Headings
+2. Lists
+   - Nested items
+   - With formatting
+
+## Code Blocks
+
+```python
+def hello_world():
+    print("Hello, world!")
+```
+
+## Tables
+
+| Name | Age | Occupation |
+|------|-----|------------|
+| John | 30  | Developer  |
+| Jane | 28  | Designer   |
+
+*This text is in italics*
+**This text is bold**
+
+> This is a blockquote
+
+---
+
+Let's see how well the conversion works!

@@ -1,0 +1,201 @@
+name: Deploy MarkItDown API
+
+on:
+  push:
+    branches:
+      - main
+      - staging
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  # Default values that can be overridden by repository variables
+  APP_NAME: ${{ vars.APP_NAME || 'markitdown-api' }}
+  REGISTRY: ${{ vars.REGISTRY || 'lax.vultrcr.com' }}
+  REGISTRY_PATH: ${{ vars.REGISTRY_PATH || 'pretuned/markitdown-api' }}
+  K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE || 'default' }}
+
+jobs:
+  determine-environment:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+    steps:
+      - id: set-env
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref }}" == "refs/heads/main" ]; then
+            echo "environment=production" >> $GITHUB_OUTPUT
+          else
+            echo "environment=staging" >> $GITHUB_OUTPUT
+          fi
+
+  deploy:
+    needs: determine-environment
+    runs-on: ubuntu-latest
+    environment: ${{ needs.determine-environment.outputs.environment }}
+    env:
+      ENVIRONMENT: ${{ needs.determine-environment.outputs.environment }}
+      REPLICAS: ${{ vars.REPLICAS || (needs.determine-environment.outputs.environment == 'production' && '3') || '2' }}
+      DOMAIN: ${{ vars.DOMAIN || (needs.determine-environment.outputs.environment == 'production' && 'markitdown-api.pretuned.ai') || 'staging-markitdown-api.pretuned.ai' }}
+      MEMORY_REQUEST: ${{ vars.MEMORY_REQUEST || '256Mi' }}
+      MEMORY_LIMIT: ${{ vars.MEMORY_LIMIT || '512Mi' }}
+      CPU_REQUEST: ${{ vars.CPU_REQUEST || '100m' }}
+      CPU_LIMIT: ${{ vars.CPU_LIMIT || '500m' }}
+      PULL_SECRET_NAME: ${{ vars.PULL_SECRET_NAME || 'vultr-registry' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.REGISTRY_PATH }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.REGISTRY_PATH }}:latest
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REGISTRY_PATH }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REGISTRY_PATH }}:buildcache,mode=max
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Set up kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBE_CONFIG }}" > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Create namespace if not exists
+        run: |
+          kubectl get namespace ${{ env.K8S_NAMESPACE }} || kubectl create namespace ${{ env.K8S_NAMESPACE }}
+
+      - name: Deploy to Kubernetes
+        run: |
+          # Create ConfigMap
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: ${{ env.APP_NAME }}-config
+            namespace: ${{ env.K8S_NAMESPACE }}
+          data:
+            LOG_LEVEL: "info"
+          EOF
+
+          # Create Deployment
+          cat <<EOF | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${{ env.APP_NAME }}
+            namespace: ${{ env.K8S_NAMESPACE }}
+          spec:
+            replicas: ${{ env.REPLICAS }}
+            selector:
+              matchLabels:
+                app: ${{ env.APP_NAME }}
+            template:
+              metadata:
+                labels:
+                  app: ${{ env.APP_NAME }}
+              spec:
+                containers:
+                - name: ${{ env.APP_NAME }}
+                  image: ${{ env.REGISTRY }}/${{ env.REGISTRY_PATH }}:${{ github.sha }}
+                  ports:
+                  - containerPort: 8000
+                  resources:
+                    requests:
+                      memory: ${{ env.MEMORY_REQUEST }}
+                      cpu: ${{ env.CPU_REQUEST }}
+                    limits:
+                      memory: ${{ env.MEMORY_LIMIT }}
+                      cpu: ${{ env.CPU_LIMIT }}
+                  envFrom:
+                  - configMapRef:
+                      name: ${{ env.APP_NAME }}-config
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8000
+                    initialDelaySeconds: 10
+                    periodSeconds: 5
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8000
+                    initialDelaySeconds: 15
+                    periodSeconds: 20
+                imagePullSecrets:
+                - name: ${{ env.PULL_SECRET_NAME }}
+          EOF
+
+          # Create Service
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${{ env.APP_NAME }}
+            namespace: ${{ env.K8S_NAMESPACE }}
+          spec:
+            selector:
+              app: ${{ env.APP_NAME }}
+            ports:
+            - port: 80
+              targetPort: 8000
+            type: ClusterIP
+          EOF
+
+          # Create Ingress
+          cat <<EOF | kubectl apply -f -
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: ${{ env.APP_NAME }}
+            namespace: ${{ env.K8S_NAMESPACE }}
+            annotations:
+              kubernetes.io/ingress.class: nginx
+              cert-manager.io/cluster-issuer: letsencrypt-prod
+          spec:
+            tls:
+            - hosts:
+              - ${{ env.DOMAIN }}
+              secretName: ${{ env.APP_NAME }}-tls
+            rules:
+            - host: ${{ env.DOMAIN }}
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: ${{ env.APP_NAME }}
+                      port:
+                        number: 80
+          EOF
+
+      - name: Verify deployment
+        run: |
+          kubectl rollout status deployment/${{ env.APP_NAME }} -n ${{ env.K8S_NAMESPACE }} --timeout=180s

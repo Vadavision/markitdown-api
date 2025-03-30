@@ -16,8 +16,8 @@ RUN apt-get update && apt-get install -y \
 # Install MarkItDown with all features
 RUN pip install --no-cache-dir markitdown[all]
 
-# Install FastAPI and Uvicorn
-RUN pip install --no-cache-dir fastapi uvicorn python-multipart
+# Install FastAPI, Uvicorn, and Redis
+RUN pip install --no-cache-dir fastapi uvicorn python-multipart redis
 
 # Copy the API code
 COPY api.py .

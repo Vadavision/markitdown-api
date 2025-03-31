@@ -12,6 +12,8 @@ import requests
 import json
 import redis
 import os
+from abc import ABC, abstractmethod
+from typing import Dict, Optional, Any, Union
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -26,13 +28,116 @@ app = FastAPI(
 # Initialize MarkItDown
 md = MarkItDown()
 
-# Initialize Redis client
-redis_host = os.environ.get("REDIS_HOST", "markitdown-redis")
-redis_port = int(os.environ.get("REDIS_PORT", "6379"))
-redis_client = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
+# Storage interface and implementations
+class JobStorage(ABC):
+    @abstractmethod
+    def set(self, key: str, value: str, expiry: int = None) -> None:
+        pass
+    
+    @abstractmethod
+    def get(self, key: str) -> Optional[str]:
+        pass
+    
+    @abstractmethod
+    def ping(self) -> bool:
+        pass
+
+# Redis storage implementation
+class RedisJobStorage(JobStorage):
+    def __init__(self, host: str, port: int):
+        self.client = redis.Redis(host=host, port=port, decode_responses=True)
+        self.host = host
+        self.port = port
+        
+    def set(self, key: str, value: str, expiry: int = None) -> None:
+        self.client.set(key, value, ex=expiry)
+        
+    def get(self, key: str) -> Optional[str]:
+        return self.client.get(key)
+        
+    def ping(self) -> bool:
+        try:
+            self.client.ping()
+            return True
+        except Exception:
+            return False
+
+# In-memory storage implementation
+class InMemoryJobStorage(JobStorage):
+    def __init__(self):
+        self.data: Dict[str, str] = {}
+        self.expiry_times: Dict[str, float] = {}
+        
+    def set(self, key: str, value: str, expiry: int = None) -> None:
+        self.data[key] = value
+        if expiry:
+            self.expiry_times[key] = time.time() + expiry
+        
+    def get(self, key: str) -> Optional[str]:
+        # Check if key exists and not expired
+        if key in self.data:
+            if key in self.expiry_times and time.time() > self.expiry_times[key]:
+                # Expired
+                del self.data[key]
+                del self.expiry_times[key]
+                return None
+            return self.data[key]
+        return None
+        
+    def ping(self) -> bool:
+        return True
 
 # Job result expiration time (in seconds) - 24 hours
 JOB_EXPIRY = 86400
+
+# Initialize Redis client for backward compatibility
+redis_host = os.environ.get("REDIS_HOST", "markitdown-redis")
+redis_port = int(os.environ.get("REDIS_PORT", "6379"))
+
+# Determine storage type based on Redis credentials
+try:
+    # Try to initialize Redis storage
+    storage = RedisJobStorage(host=redis_host, port=redis_port)
+    if storage.ping():
+        logger.info(f"Using Redis storage at {redis_host}:{redis_port}")
+        # For backward compatibility
+        redis_client = storage.client
+    else:
+        logger.warning(f"Could not connect to Redis at {redis_host}:{redis_port}, falling back to in-memory storage")
+        storage = InMemoryJobStorage()
+        # For backward compatibility - create a dummy client that redirects to storage
+        class DummyRedisClient:
+            def __init__(self, storage):
+                self.storage = storage
+            
+            def set(self, key, value, ex=None):
+                return self.storage.set(key, value, expiry=ex)
+            
+            def get(self, key):
+                return self.storage.get(key)
+            
+            def ping(self):
+                return self.storage.ping()
+        
+        redis_client = DummyRedisClient(storage)
+except Exception as e:
+    logger.warning(f"Error initializing Redis: {str(e)}, using in-memory storage")
+    storage = InMemoryJobStorage()
+    # For backward compatibility
+    class DummyRedisClient:
+        def __init__(self, storage):
+            self.storage = storage
+        
+        def set(self, key, value, ex=None):
+            return self.storage.set(key, value, expiry=ex)
+        
+        def get(self, key):
+            return self.storage.get(key)
+        
+        def ping(self):
+            return self.storage.ping()
+    
+    redis_client = DummyRedisClient(storage)
 
 # Model for URL request
 class URLRequest(BaseModel):
@@ -40,9 +145,11 @@ class URLRequest(BaseModel):
 
 @app.get("/")
 def root():
+    storage_type = "redis" if isinstance(storage, RedisJobStorage) else "in-memory"
     return {
         "service": "MarkItDown API",
         "version": "1.0.0",
+        "storage": storage_type,
         "endpoints": [
             {"path": "/health", "method": "GET", "description": "Health check endpoint"},
             {"path": "/convert", "method": "POST", "description": "Convert a file to Markdown"},
@@ -54,6 +161,7 @@ def root():
 @app.get("/health")
 def health_check():
     # Check Redis connection
+    storage_type = "redis" if isinstance(storage, RedisJobStorage) else "in-memory"
     try:
         redis_client.ping()
         redis_status = "connected"
@@ -63,7 +171,8 @@ def health_check():
     return {
         "status": "healthy", 
         "timestamp": time.time(),
-        "redis": redis_status
+        "redis": redis_status,
+        "storage_type": storage_type
     }
 
 def process_file(file_path: str, job_id: str):
@@ -195,12 +304,18 @@ async def get_job_status(job_id: str):
 @app.on_event("startup")
 async def startup_event():
     logger.info("MarkItDown API starting up")
+    storage_type = "Redis" if isinstance(storage, RedisJobStorage) else "in-memory"
+    logger.info(f"Using {storage_type} storage")
+    
     # Try to connect to Redis
-    try:
-        redis_client.ping()
-        logger.info(f"Connected to Redis at {redis_host}:{redis_port}")
-    except Exception as e:
-        logger.error(f"Failed to connect to Redis: {str(e)}")
+    if isinstance(storage, RedisJobStorage):
+        try:
+            if storage.ping():
+                logger.info(f"Connected to Redis at {storage.host}:{storage.port}")
+            else:
+                logger.error("Failed to connect to Redis")
+        except Exception as e:
+            logger.error(f"Failed to connect to Redis: {str(e)}")
 
 @app.on_event("shutdown")
 async def shutdown_event():

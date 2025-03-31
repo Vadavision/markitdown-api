@@ -1,145 +1,221 @@
-# MarkItDown API Service
+# MarkItDown API
 
-This project provides a REST API wrapper for Microsoft's [MarkItDown](https://github.com/microsoft/markitdown) library, which converts various file formats to Markdown.
+A FastAPI-based service for converting various document formats to Markdown using the MarkItDown library.
 
 ## Features
 
-- REST API for document conversion
+- Convert uploaded files to Markdown
+- Convert web URLs to Markdown
 - Asynchronous processing with job status tracking
-- Kubernetes deployment ready
-- Easily integrates with NestJS applications
+- Health check endpoint
+- Automatic storage selection (Redis or in-memory)
 
-## Local Development
+## Requirements
 
-### Prerequisites
-
-- Docker
 - Python 3.10+
-- FastAPI
-- MarkItDown
+- FFmpeg, ExifTool, Poppler-utils, Tesseract OCR, and LibreOffice (for document conversion)
+- Redis server (optional, recommended for production)
 
-### Building the Docker Image
+## Usage Instructions
 
+### Option 1: Using Virtual Environment
+
+This setup allows you to run the application directly on your machine with the most flexibility.
+
+#### Prerequisites
+
+**Install system dependencies:**
+
+On Ubuntu/Debian:
 ```bash
-docker build -t markitdown-api:latest .
+sudo apt-get update && sudo apt-get install -y \
+    ffmpeg \
+    libmagic1 \
+    exiftool \
+    poppler-utils \
+    tesseract-ocr \
+    libreoffice
 ```
 
-### Running Locally
-
+On macOS:
 ```bash
-docker run -p 8000:8000 markitdown-api:latest
+brew install ffmpeg libmagic exiftool poppler tesseract libreoffice
 ```
 
-The API will be available at http://localhost:8000
+#### Installation
 
-## Kubernetes Deployment
+1. **Clone the repository:**
 
-### Prerequisites
+   ```bash
+   git clone https://github.com/vadavision/markitdown-api.git
+   cd markitdown-api
+   ```
 
-- Kubernetes cluster
-- kubectl configured to access your cluster
-- Container registry access
+2. **Create and activate a virtual environment:**
 
-### Deployment Steps
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   ```
 
-1. Update the image path in `k8s/deployment.yaml` to match your registry
-2. Push the Docker image to your registry
-3. Apply the Kubernetes configuration:
+3. **Install Python dependencies:**
 
-```bash
-kubectl apply -f k8s/deployment.yaml
-kubectl apply -f k8s/service.yaml
-```
+   ```bash
+   # For basic installation (will use in-memory storage if Redis is not available)
+   pip install markitdown[all] fastapi uvicorn python-multipart
+   
+   # To use Redis storage (recommended for production)
+   pip install markitdown[all] fastapi uvicorn python-multipart redis
+   ```
 
-## Automated Deployment with GitHub Actions
+4. **Run the API server:**
 
-This repository includes GitHub Actions workflows for automated deployment to Kubernetes clusters. The deployment process is configured to work with both staging and production environments.
+   **Without Redis (in-memory storage):**
 
-### GitHub Actions Workflow
+   The application will automatically use in-memory storage if Redis is not available or if no Redis configuration is provided.
 
-The deployment workflow is defined in `.github/workflows/deploy.yml` and supports:
+   ```bash
+   # Start the server with default settings (will use in-memory storage)
+   uvicorn api:app --host 0.0.0.0 --port 8000 --reload
+   ```
 
-- Automatic deployment on pushes to `main` (production) and `staging` branches
-- Manual deployment via GitHub Actions workflow dispatch
-- Environment-specific configuration via GitHub repository variables
+   **With Redis (recommended for production):**
 
-### Configuration Variables
+   First, start Redis server:
+   ```bash
+   # Install Redis if not already installed
+   # Ubuntu/Debian: sudo apt-get install redis-server
+   # macOS: brew install redis
+   
+   # Start Redis server in a separate terminal
+   redis-server
+   ```
 
-The following variables can be configured in your GitHub repository settings:
+   Then start the API with Redis configuration:
+   ```bash
+   # Configure Redis connection
+   export REDIS_HOST=localhost  # On Windows: set REDIS_HOST=localhost
+   export REDIS_PORT=6379       # On Windows: set REDIS_PORT=6379
+   
+   # Start the server
+   uvicorn api:app --host 0.0.0.0 --port 8000 --reload
+   ```
 
-| Variable | Description | Default Value |
-|----------|-------------|---------------|
-| APP_NAME | Application name | markitdown-api |
-| REGISTRY | Container registry URL | lax.vultrcr.com |
-| REGISTRY_PATH | Path within registry | pretuned/markitdown-api |
-| K8S_NAMESPACE | Kubernetes namespace | default |
-| REPLICAS | Number of replicas | 2 (staging), 3 (production) |
-| DOMAIN | Public domain | staging-markitdown-api.pretuned.ai (staging), markitdown-api.pretuned.ai (production) |
-| MEMORY_REQUEST | Memory request | 256Mi |
-| MEMORY_LIMIT | Memory limit | 512Mi |
-| CPU_REQUEST | CPU request | 100m |
-| CPU_LIMIT | CPU limit | 500m |
-| PULL_SECRET_NAME | Image pull secret name | vultr-registry |
+5. **Access the API:**
 
-### Required Secrets
+   Open your browser and navigate to [http://localhost:8000](http://localhost:8000)
 
-The following secrets must be configured in your GitHub repository:
+### Option 2: Using Docker
 
-- `DOCKER_USERNAME`: Username for container registry authentication
-- `DOCKER_PASSWORD`: Password for container registry authentication
-- `KUBE_CONFIG`: Kubernetes configuration file content (base64 encoded)
-- `REPO_ACCESS_TOKEN`: GitHub token with repository access (for cross-repo triggers)
+This is useful for consistent environments and when you don't want to install dependencies directly on your system.
 
-### Integration with Backend API
+#### Prerequisites
 
-The MarkItDown API is designed to be deployed as a microservice alongside the main backend API. The backend API is configured to communicate with the MarkItDown service using the following environment variable:
+- [Docker](https://docs.docker.com/get-docker/)
+- [Docker Compose](https://docs.docker.com/compose/install/) (for running with Redis)
 
-```
-MARKITDOWN_URL=http://markitdown-api.default.svc.cluster.local
-```
+#### Steps
 
-This URL is automatically configured in the backend API's deployment process.
+1. **Clone the repository:**
+
+   ```bash
+   git clone https://github.com/vadavision/markitdown-api.git
+   cd markitdown-api
+   ```
+
+2. **Using Docker Compose with Redis (recommended for production):**
+
+   Create a `docker-compose.yml` file:
+
+   ```yaml
+   version: '3'
+   services:
+     api:
+       build: .
+       ports:
+         - "8000:8000"
+       environment:
+         - REDIS_HOST=redis
+       depends_on:
+         - redis
+     redis:
+       image: redis:alpine
+       ports:
+         - "6379:6379"
+   ```
+
+   Then run:
+
+   ```bash
+   docker-compose up
+   ```
+
+3. **Using Docker with in-memory storage (for development):**
+
+   ```bash
+   # Build the image
+   docker build -t markitdown-api .
+   
+   # Run with non-existent Redis host to trigger in-memory fallback
+   docker run -p 8000:8000 -e REDIS_HOST=non-existent-host markitdown-api
+   ```
+
+4. **Access the API:**
+
+   Open your browser and navigate to [http://localhost:8000](http://localhost:8000)
 
 ## API Endpoints
 
-- `GET /health` - Health check endpoint
-- `POST /convert` - Convert a file to Markdown
-- `GET /status/{job_id}` - Check conversion job status
+- `GET /`: API information (includes storage type being used)
+- `GET /health`: Health check endpoint (shows storage type and connection status)
+- `POST /convert`: Convert a file to Markdown
+- `POST /convert-url`: Convert a URL to Markdown
+- `GET /status/{job_id}`: Check conversion job status
 
-## Integration with NestJS
+## Example Usage
 
-The NestJS integration module is available in the `pretuned__backend-api` project under:
-`src/api/v1/modules/document-converter`
+### Convert a File
 
-### Environment Configuration
-
-Add the following to your `.env` file:
-
+```bash
+curl -X POST http://localhost:8000/convert \
+  -H "Content-Type: multipart/form-data" \
+  -F "file=@path/to/your/document.pdf"
 ```
-MARKITDOWN_URL=http://markitdown-service
+
+### Convert a URL
+
+```bash
+curl -X POST http://localhost:8000/convert-url \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com/document.html"}'
 ```
 
-For local development, you can set this to `http://localhost:8000` if running the MarkItDown API locally.
+### Check Job Status
 
-## Usage Example
-
-```typescript
-// In your NestJS service
-import { DocumentConverterService } from '../document-converter';
-
-@Injectable()
-export class YourService {
-  constructor(private readonly documentConverterService: DocumentConverterService) {}
-
-  async processDocument(filePath: string) {
-    const result = await this.documentConverterService.convertToMarkdown(filePath);
-    // Use the markdown content
-    console.log(result.markdown);
-    return result;
-  }
-}
+```bash
+curl -X GET http://localhost:8000/status/your-job-id
 ```
+
+## Storage Options
+
+The application automatically selects the storage backend based on Redis availability:
+
+### Redis Storage (Default for Production)
+
+- **When used**: When valid Redis credentials are provided and connection is successful
+- **Configuration**: Set `REDIS_HOST` and `REDIS_PORT` environment variables
+- **Benefits**: Persistent storage, works across multiple instances, automatic expiration
+
+### In-Memory Storage (Fallback for Development)
+
+- **When used**: When Redis connection fails or is not configured
+- **Benefits**: No additional dependencies required, simple setup
+- **Limitations**: Job data is lost when the server restarts, not suitable for distributed systems
+
+## Deployment
+
+For more detailed production deployment information, please refer to the [DEPLOYMENT.md](DEPLOYMENT.md) file.
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+[MIT License](LICENSE)

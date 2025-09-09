@@ -1,5 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from markitdown import MarkItDown
 from pydantic import BaseModel
 import tempfile
@@ -12,8 +12,9 @@ import requests
 import json
 import redis
 import os
+import re
 from abc import ABC, abstractmethod
-from typing import Dict, Optional, Any, Union
+from typing import Dict, Optional, Any, Union, AsyncGenerator
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -154,7 +155,8 @@ def root():
             {"path": "/health", "method": "GET", "description": "Health check endpoint"},
             {"path": "/convert", "method": "POST", "description": "Convert a file to Markdown"},
             {"path": "/status/{job_id}", "method": "GET", "description": "Check conversion job status"},
-            {"path": "/convert-url", "method": "POST", "description": "Convert a URL to Markdown"}
+            {"path": "/convert-url", "method": "POST", "description": "Convert a URL to Markdown"},
+            {"path": "/convert-url-stream", "method": "POST", "description": "Convert a URL to Markdown and stream paragraphs"}
         ]
     }
 
@@ -229,6 +231,145 @@ def process_url(url: str, job_id: str):
         redis_client.set(f"job:{job_id}", json.dumps(job_result), ex=JOB_EXPIRY)
         logger.error(f"URL conversion failed for job {job_id}: {str(e)}")
 
+def split_markdown_into_paragraphs(markdown: str) -> list[str]:
+    """
+    Split markdown into meaningful paragraphs/chunks for streaming.
+    Preserves markdown structure while creating reasonable chunks.
+    """
+    if not markdown or not markdown.strip():
+        return []
+    
+    # Split by double newlines (paragraph breaks)
+    paragraphs = re.split(r'\n\s*\n', markdown.strip())
+    
+    chunks = []
+    current_chunk = ""
+    max_chunk_size = 2000  # Target chunk size
+    min_chunk_size = 500   # Minimum chunk size before forcing split
+    
+    for paragraph in paragraphs:
+        paragraph = paragraph.strip()
+        if not paragraph:
+            continue
+            
+        # If adding this paragraph would make chunk too large
+        if current_chunk and len(current_chunk + "\n\n" + paragraph) > max_chunk_size:
+            # Save current chunk if it's substantial
+            if len(current_chunk) > min_chunk_size:
+                chunks.append(current_chunk.strip())
+                current_chunk = paragraph
+            else:
+                # Current chunk is too small, add this paragraph anyway
+                current_chunk += "\n\n" + paragraph
+        else:
+            # Add paragraph to current chunk
+            if current_chunk:
+                current_chunk += "\n\n" + paragraph
+            else:
+                current_chunk = paragraph
+    
+    # Add final chunk
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+    
+    return chunks
+
+def create_smart_batches(chunks: list[str], max_batch_size: int = 32, max_tokens_per_batch: int = 8000) -> list[list[str]]:
+    """
+    Create intelligent batches for efficient API calls.
+    Groups chunks into batches considering both count and token limits.
+    """
+    if not chunks:
+        return []
+    
+    batches = []
+    current_batch = []
+    current_token_count = 0
+    
+    for chunk in chunks:
+        # Rough token estimation: ~4 chars per token
+        chunk_tokens = len(chunk) // 4
+        
+        # Check if adding this chunk would exceed limits
+        if (len(current_batch) >= max_batch_size or 
+            (current_batch and current_token_count + chunk_tokens > max_tokens_per_batch)):
+            
+            # Save current batch and start new one
+            if current_batch:
+                batches.append(current_batch)
+                current_batch = []
+                current_token_count = 0
+        
+        # Add chunk to current batch
+        current_batch.append(chunk)
+        current_token_count += chunk_tokens
+    
+    # Add final batch
+    if current_batch:
+        batches.append(current_batch)
+    
+    return batches
+
+async def stream_url_conversion(url: str) -> AsyncGenerator[str, None]:
+    """
+    Convert URL to markdown and stream back as paragraphs.
+    """
+    try:
+        logger.info(f"Starting streaming conversion for URL: {url}")
+        
+        # Convert the URL to markdown
+        result = md.convert_url(url)
+        markdown = result.markdown
+        
+        if not markdown or not markdown.strip():
+            yield json.dumps({"error": "No content extracted from URL"}) + "\n"
+            return
+            
+        # Split into paragraphs/chunks
+        chunks = split_markdown_into_paragraphs(markdown)
+        
+        # Create smart batches for efficient processing
+        batches = create_smart_batches(chunks, max_batch_size=32, max_tokens_per_batch=8000)
+        
+        logger.info(f"Split markdown into {len(chunks)} chunks, organized into {len(batches)} batches")
+        
+        # Stream metadata first
+        metadata = {
+            "type": "metadata",
+            "filename": os.path.basename(url) or "url_content",
+            "total_chunks": len(chunks),
+            "total_batches": len(batches)
+        }
+        yield json.dumps(metadata) + "\n"
+        
+        # Stream each batch
+        for batch_idx, batch in enumerate(batches):
+            batch_data = {
+                "type": "batch",
+                "batch_index": batch_idx,
+                "chunks": batch,
+                "chunk_count": len(batch),
+                "total_batches": len(batches)
+            }
+            yield json.dumps(batch_data) + "\n"
+            
+        # Stream completion marker
+        completion = {
+            "type": "complete",
+            "total_chunks": len(chunks)
+        }
+        yield json.dumps(completion) + "\n"
+        
+        logger.info(f"Completed streaming conversion for URL: {url}")
+        
+    except Exception as e:
+        error_data = {
+            "type": "error",
+            "error": str(e)
+        }
+        yield json.dumps(error_data) + "\n"
+        logger.error(f"Error in streaming conversion: {str(e)}")
+
 @app.post("/convert")
 async def convert_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     # Generate a job ID
@@ -288,6 +429,24 @@ async def convert_url(background_tasks: BackgroundTasks, url_request: URLRequest
         }
     except Exception as e:
         # Clean up on error
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/convert-url-stream")
+async def convert_url_stream(url_request: URLRequest):
+    """
+    Convert a URL to markdown and stream back as JSON-delimited paragraphs.
+    Each line contains a JSON object with type: metadata|chunk|complete|error
+    """
+    try:
+        return StreamingResponse(
+            stream_url_conversion(url_request.url),
+            media_type="application/x-ndjson",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            }
+        )
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/status/{job_id}")

@@ -1,0 +1,26 @@
+# Core FastAPI dependencies
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+
+# Storage/Caching
+redis>=5.0.0
+
+# Document processing - MarkItDown with all features
+markitdown[all]>=0.0.1
+
+# HTTP requests (used in api.py)
+requests>=2.31.0
+
+# Data validation
+pydantic>=2.0.0
+
+# Note: Standard library modules used (no additional requirements):
+# - tempfile, os, shutil, logging, uuid, time, json, re
+# - abc, typing
+# - asyncio (for async generators)
+
+
+
+
+

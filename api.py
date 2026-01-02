@@ -20,6 +20,60 @@ from typing import Dict, Optional, Any, Union, AsyncGenerator
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("markitdown-api")
 
+# Bright Data Web Unlocker configuration
+BRIGHTDATA_API_TOKEN = os.environ.get("BRIGHTDATA_API_TOKEN", "")
+BRIGHTDATA_ZONE = os.environ.get("BRIGHTDATA_ZONE", "web_unlocker1")
+BRIGHTDATA_API_URL = "https://api.brightdata.com/request"
+
+
+def is_blocked_error(error: Exception) -> bool:
+    """
+    Check if the error indicates the request was blocked (403, captcha, etc.)
+    """
+    error_str = str(error).lower()
+    # Check for common blocking indicators
+    blocked_indicators = [
+        "403", "forbidden",
+        "captcha", "challenge",
+        "blocked", "denied",
+        "access denied", "bot",
+        "429", "too many requests",
+        "cloudflare", "security check"
+    ]
+    return any(indicator in error_str for indicator in blocked_indicators)
+
+
+def fetch_via_brightdata(url: str) -> str:
+    """
+    Fetch URL content via Bright Data Web Unlocker API.
+    Returns markdown content directly.
+    """
+    if not BRIGHTDATA_API_TOKEN:
+        raise ValueError("BRIGHTDATA_API_TOKEN environment variable not set")
+
+    headers = {
+        "Authorization": f"Bearer {BRIGHTDATA_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "zone": BRIGHTDATA_ZONE,
+        "url": url,
+        "format": "raw",
+        "data_format": "markdown"
+    }
+
+    logger.info(f"Fetching URL via Bright Data Web Unlocker: {url}")
+
+    response = requests.post(BRIGHTDATA_API_URL, headers=headers, json=payload, timeout=60)
+    response.raise_for_status()
+
+    markdown_content = response.text
+    logger.info(f"Successfully fetched URL via Bright Data: {url} ({len(markdown_content)} chars)")
+
+    return markdown_content
+
+
 app = FastAPI(
     title="MarkItDown API", 
     description="API for converting documents to Markdown",
@@ -211,25 +265,81 @@ def process_file(file_path: str, job_id: str):
 
 def process_url(url: str, job_id: str):
     try:
-        # Convert the URL directly to markdown using MarkItDown's URL capability
-        result = md.convert_url(url)
-        
+        logger.info(f"Starting URL conversion for job {job_id}: {url}")
+
+        # Update status to processing
+        processing_status = {
+            "status": "processing",
+            "url": url,
+            "filename": os.path.basename(url) or "url_content"
+        }
+        redis_client.set(f"job:{job_id}", json.dumps(processing_status), ex=JOB_EXPIRY)
+
+        markdown_content = None
+        used_brightdata = False
+
+        # Try MarkItDown first
+        try:
+            result = md.convert_url(url)
+            markdown_content = result.markdown
+            logger.info(f"URL conversion completed via MarkItDown for job {job_id}")
+        except Exception as e:
+            # Check if this is a blocking error (403, captcha, etc.)
+            if is_blocked_error(e) and BRIGHTDATA_API_TOKEN:
+                logger.warning(f"Direct fetch blocked for {url}, trying Bright Data fallback: {str(e)}")
+                try:
+                    markdown_content = fetch_via_brightdata(url)
+                    used_brightdata = True
+                    logger.info(f"URL conversion completed via Bright Data for job {job_id}")
+                except Exception as bd_error:
+                    # Bright Data also failed, raise the original error
+                    logger.error(f"Bright Data fallback also failed for {url}: {str(bd_error)}")
+                    raise e
+            else:
+                # Not a blocking error or no Bright Data token, re-raise
+                raise e
+
         # Store job result in Redis
         job_result = {
             "status": "completed",
-            "markdown": result.markdown,
-            "filename": os.path.basename(url) or "url_content"
+            "markdown": markdown_content,
+            "filename": os.path.basename(url) or "url_content",
+            "source": "brightdata" if used_brightdata else "direct"
         }
         redis_client.set(f"job:{job_id}", json.dumps(job_result), ex=JOB_EXPIRY)
-        logger.info(f"URL conversion completed for job {job_id}")
-    except Exception as e:
-        # Store error in Redis
+
+    except requests.exceptions.HTTPError as e:
+        # Handle HTTP errors specifically
+        error_msg = f"HTTP error: {str(e)}"
         job_result = {
             "status": "failed",
-            "error": str(e)
+            "error": error_msg,
+            "url": url
         }
         redis_client.set(f"job:{job_id}", json.dumps(job_result), ex=JOB_EXPIRY)
-        logger.error(f"URL conversion failed for job {job_id}: {str(e)}")
+        logger.error(f"URL conversion failed for job {job_id}: {error_msg}")
+
+    except requests.exceptions.RequestException as e:
+        # Handle other request errors
+        error_msg = f"Request error: {str(e)}"
+        job_result = {
+            "status": "failed",
+            "error": error_msg,
+            "url": url
+        }
+        redis_client.set(f"job:{job_id}", json.dumps(job_result), ex=JOB_EXPIRY)
+        logger.error(f"URL conversion failed for job {job_id}: {error_msg}")
+
+    except Exception as e:
+        # Handle any other errors
+        error_msg = f"Conversion error: {str(e)}"
+        job_result = {
+            "status": "failed",
+            "error": error_msg,
+            "url": url
+        }
+        redis_client.set(f"job:{job_id}", json.dumps(job_result), ex=JOB_EXPIRY)
+        logger.error(f"URL conversion failed for job {job_id}: {error_msg}")
 
 def split_markdown_into_paragraphs(markdown: str) -> list[str]:
     """
@@ -313,35 +423,57 @@ def create_smart_batches(chunks: list[str], max_batch_size: int = 32, max_tokens
 async def stream_url_conversion(url: str) -> AsyncGenerator[str, None]:
     """
     Convert URL to markdown and stream back as paragraphs.
+    Falls back to Bright Data Web Unlocker if direct fetch is blocked.
     """
     try:
         logger.info(f"Starting streaming conversion for URL: {url}")
-        
-        # Convert the URL to markdown
-        result = md.convert_url(url)
-        markdown = result.markdown
-        
+
+        markdown = None
+        used_brightdata = False
+
+        # Try MarkItDown first
+        try:
+            result = md.convert_url(url)
+            markdown = result.markdown
+            logger.info(f"Streaming conversion via MarkItDown for URL: {url}")
+        except Exception as e:
+            # Check if this is a blocking error (403, captcha, etc.)
+            if is_blocked_error(e) and BRIGHTDATA_API_TOKEN:
+                logger.warning(f"Direct fetch blocked for {url}, trying Bright Data fallback: {str(e)}")
+                try:
+                    markdown = fetch_via_brightdata(url)
+                    used_brightdata = True
+                    logger.info(f"Streaming conversion via Bright Data for URL: {url}")
+                except Exception as bd_error:
+                    # Bright Data also failed, raise the original error
+                    logger.error(f"Bright Data fallback also failed for {url}: {str(bd_error)}")
+                    raise e
+            else:
+                # Not a blocking error or no Bright Data token, re-raise
+                raise e
+
         if not markdown or not markdown.strip():
-            yield json.dumps({"error": "No content extracted from URL"}) + "\n"
+            yield json.dumps({"type": "error", "error": "No content extracted from URL"}) + "\n"
             return
-            
+
         # Split into paragraphs/chunks
         chunks = split_markdown_into_paragraphs(markdown)
-        
+
         # Create smart batches for efficient processing
         batches = create_smart_batches(chunks, max_batch_size=32, max_tokens_per_batch=8000)
-        
+
         logger.info(f"Split markdown into {len(chunks)} chunks, organized into {len(batches)} batches")
-        
+
         # Stream metadata first
         metadata = {
             "type": "metadata",
             "filename": os.path.basename(url) or "url_content",
             "total_chunks": len(chunks),
-            "total_batches": len(batches)
+            "total_batches": len(batches),
+            "source": "brightdata" if used_brightdata else "direct"
         }
         yield json.dumps(metadata) + "\n"
-        
+
         # Stream each batch
         for batch_idx, batch in enumerate(batches):
             batch_data = {
@@ -352,23 +484,43 @@ async def stream_url_conversion(url: str) -> AsyncGenerator[str, None]:
                 "total_batches": len(batches)
             }
             yield json.dumps(batch_data) + "\n"
-            
+
         # Stream completion marker
         completion = {
             "type": "complete",
-            "total_chunks": len(chunks)
+            "total_chunks": len(chunks),
+            "source": "brightdata" if used_brightdata else "direct"
         }
         yield json.dumps(completion) + "\n"
-        
-        logger.info(f"Completed streaming conversion for URL: {url}")
-        
+
+        logger.info(f"Completed streaming conversion for URL: {url} (source: {'brightdata' if used_brightdata else 'direct'})")
+
+    except requests.exceptions.HTTPError as e:
+        error_data = {
+            "type": "error",
+            "error": f"HTTP error: {str(e)}",
+            "url": url
+        }
+        yield json.dumps(error_data) + "\n"
+        logger.error(f"HTTP error in streaming conversion for {url}: {str(e)}")
+
+    except requests.exceptions.RequestException as e:
+        error_data = {
+            "type": "error",
+            "error": f"Request error: {str(e)}",
+            "url": url
+        }
+        yield json.dumps(error_data) + "\n"
+        logger.error(f"Request error in streaming conversion for {url}: {str(e)}")
+
     except Exception as e:
         error_data = {
             "type": "error",
-            "error": str(e)
+            "error": f"Conversion error: {str(e)}",
+            "url": url
         }
         yield json.dumps(error_data) + "\n"
-        logger.error(f"Error in streaming conversion: {str(e)}")
+        logger.error(f"Error in streaming conversion for {url}: {str(e)}")
 
 @app.post("/convert")
 async def convert_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)):

@@ -1,8 +1,8 @@
 FROM python:3.10-slim
 
-WORKDIR /app
+WORKDIR /code
 
-# Update package lists and install system dependencies 
+# Update package lists and install system dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     ffmpeg \
@@ -12,23 +12,29 @@ RUN apt-get update && \
     tesseract-ocr \
     libreoffice \
     default-jre-headless \
+    curl \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Upgrade pip and install Python dependencies
+# Upgrade pip
 RUN pip install --no-cache-dir --upgrade pip
 
-# Install core dependencies first
-RUN pip install --no-cache-dir fastapi uvicorn python-multipart redis
+# Copy requirements first for better caching
+COPY requirements.txt .
 
-# Install MarkItDown with all features (required for full document support)
-RUN pip install --no-cache-dir markitdown[all]
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the API code
+# Copy the application code
+COPY app/ ./app/
 COPY api.py .
 
 # Expose the port
 EXPOSE 8000
 
-# Run the API
-CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
+# Environment variables (set defaults, override in docker-compose or runtime)
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Run the API (using new app structure)
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

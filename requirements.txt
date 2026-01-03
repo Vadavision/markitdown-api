@@ -1,5 +1,6 @@
 # Core FastAPI dependencies
 fastapi>=0.104.0
+python-dotenv>=1.0.0
 uvicorn[standard]>=0.24.0
 python-multipart>=0.0.6
 
@@ -9,18 +10,31 @@ redis>=5.0.0
 # Document processing - MarkItDown with all features
 markitdown[all]>=0.0.1
 
-# HTTP requests (used in api.py)
-requests>=2.31.0
+# Async HTTP client (replaces requests)
+httpx>=0.25.0
+
+# Zstandard compression support (for sites like Amazon using zstd encoding)
+zstandard>=0.22.0
+
+# Playwright for connecting to Bright Data Scraping Browser (remote browser - no local install needed)
+playwright>=1.40.0
 
 # Data validation
 pydantic>=2.0.0
 
-# Note: Standard library modules used (no additional requirements):
-# - tempfile, os, shutil, logging, uuid, time, json, re
-# - abc, typing
-# - asyncio (for async generators)
+# Resilience - retry with exponential backoff
+tenacity>=8.2.0
 
+# Text chunking - langchain's markdown-aware splitter
+langchain-text-splitters>=0.0.1
 
+# Token counting - accurate GPT/Claude token estimation
+tiktoken>=0.5.0
 
+# Structured logging with JSON output
+structlog>=23.2.0
 
-
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-timeout>=2.2.0

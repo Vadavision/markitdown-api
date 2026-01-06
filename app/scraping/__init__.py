@@ -1,10 +1,13 @@
 """
-Scraping modules - Bright Data, utils.
+Scraping modules - Bright Data Web Unlocker, utils.
+CDP/Scraping Browser is in app.core.cdp_queue.
 """
-from app.scraping.utils import is_blocked_error
-from app.scraping.brightdata import fetch_via_brightdata, fetch_with_js_rendering, md
+from app.scraping.utils import is_blocked_error, is_social_media_url
+from app.scraping.brightdata import fetch_via_brightdata, md
 
 __all__ = [
     "is_blocked_error",
-    "fetch_via_brightdata", "fetch_with_js_rendering", "md",
+    "is_social_media_url",
+    "fetch_via_brightdata",
+    "md",
 ]

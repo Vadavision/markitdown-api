@@ -14,13 +14,13 @@ from fastapi.responses import StreamingResponse
 
 from app.logging_config import logger, request_id_ctx
 from app.config import JOB_EXPIRY
-from app.models import URLRequest, DeepSearchRequest
+from app.models import URLRequest, SearchRequest, FetchRequest
 from app.core.storage import storage, redis_client, RedisJobStorage
 from app.core.cache import content_cache
-from app.core.playwright_pool import playwright_pool
 from app.services.conversion import process_url, md
 from app.services.streaming import stream_url_conversion
-from app.services.deep_search import deep_search_stream
+from app.services.deep_search import search_stream, fetch_stream
+from app.core.cdp_queue import shutdown_cdp_pool
 
 
 # Create FastAPI app
@@ -70,7 +70,8 @@ def root():
             {"path": "/status/{job_id}", "method": "GET", "description": "Check conversion job status"},
             {"path": "/convert-url", "method": "POST", "description": "Convert a URL to Markdown"},
             {"path": "/convert-url-stream", "method": "POST", "description": "Convert a URL to Markdown and stream paragraphs"},
-            {"path": "/deep-search", "method": "POST", "description": "Search, scrape, chunk, rerank pipeline with streaming"}
+            {"path": "/search", "method": "POST", "description": "Search, scrape, chunk, rerank with pagination (page, limit, top_k)"},
+            {"path": "/fetch", "method": "POST", "description": "Fetch single URL with auto CDP fallback (url, query, top_k)"}
         ]
     }
 
@@ -215,31 +216,58 @@ async def convert_url_stream(url_request: URLRequest):
     )
 
 
-@app.post("/deep-search")
-async def deep_search(request: DeepSearchRequest):
+@app.post("/search")
+async def search(request: SearchRequest):
     """
-    Deep search pipeline with streaming progress.
+    Web search with scraping, chunking, and reranking.
+    Agent-friendly endpoint with clean parameters.
 
-    Pipeline:
-    1. Search via SERP API
-    2. Scrape top URLs in parallel
-    3. Chunk all content
-    4. Rerank with Jina Reranker
-    5. Return top relevant chunks
+    Args:
+        query: Search query (required)
+        page: SERP page number, 1-indexed (default: 1)
+        limit: Results per SERP page (default: 10)
+        top_k: Top chunks to return after reranking (default: 8)
 
-    Streams JSON-delimited progress updates and results:
+    Streams JSON-delimited progress updates:
     - type: progress (status updates)
     - type: sources (list of scraped sources)
     - type: chunk (individual ranked chunks with scores)
-    - type: done (completion with summary)
+    - type: done (completion with summary including page number)
     - type: error (if something fails)
     """
     return StreamingResponse(
-        deep_search_stream(
+        search_stream(
             query=request.query,
-            num_results=request.num_results,
-            num_sources=request.num_sources,
-            top_chunks=request.top_chunks
+            page=request.page or 1,
+            limit=request.limit,
+            top_k=request.top_k
+        ),
+        media_type="application/x-ndjson",
+    )
+
+
+@app.post("/fetch")
+async def fetch(request: FetchRequest):
+    """
+    Fetch a single URL with automatic CDP (browser) fallback.
+    Use this when you need to dive deeper into a specific page.
+
+    Args:
+        url: URL to fetch (required)
+        query: Optional query for relevance checking & focused reranking
+        top_k: Top chunks if query provided (default: 10)
+
+    Streams JSON-delimited progress updates:
+    - type: progress (status updates)
+    - type: chunk (content chunks, ranked if query provided)
+    - type: done (completion with used_cdp flag)
+    - type: error (if something fails)
+    """
+    return StreamingResponse(
+        fetch_stream(
+            url=request.url,
+            query=request.query,
+            top_k=request.top_k
         ),
         media_type="application/x-ndjson",
     )
@@ -283,9 +311,8 @@ async def shutdown_event():
     """Application shutdown."""
     logger.info("api_shutdown_start")
 
-    # Close Playwright pool
-    if playwright_pool:
-        await playwright_pool.close()
+    # Shutdown CDP worker pool
+    await shutdown_cdp_pool()
 
     # Clear content cache
     if content_cache:

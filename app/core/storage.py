@@ -1,6 +1,5 @@
 """
 Job storage implementations (Redis and In-Memory).
-Extracted from api.py - DO NOT MODIFY unless updating source.
 """
 import time
 import redis
@@ -8,7 +7,7 @@ from abc import ABC, abstractmethod
 from typing import Dict, Optional
 
 from app.logging_config import logger
-from app.config import REDIS_HOST, REDIS_PORT, JOB_EXPIRY
+from app.config import REDIS_HOST, REDIS_PORT
 
 
 # Storage interface and implementations
@@ -57,10 +56,8 @@ class InMemoryJobStorage(JobStorage):
             self.expiry_times[key] = time.time() + expiry
 
     def get(self, key: str) -> Optional[str]:
-        # Check if key exists and not expired
         if key in self.data:
             if key in self.expiry_times and time.time() > self.expiry_times[key]:
-                # Expired
                 del self.data[key]
                 del self.expiry_times[key]
                 return None

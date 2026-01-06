@@ -36,8 +36,6 @@ JINA_API_KEY = os.environ.get("JINA_API_KEY", "")
 # Uses https://api.brightdata.com/request with zone and Google search URL
 BRIGHTDATA_SERP_ZONE = os.environ.get("BRIGHTDATA_SERP_ZONE", "serp_api1")
 
-# Deep search parameters
-DEEP_SEARCH_MAX_RESULTS = int(os.environ.get("DEEP_SEARCH_MAX_RESULTS", "10"))
-DEEP_SEARCH_MAX_SOURCES = int(os.environ.get("DEEP_SEARCH_MAX_SOURCES", "4"))
-DEEP_SEARCH_TOP_CHUNKS = int(os.environ.get("DEEP_SEARCH_TOP_CHUNKS", "8"))
-# Chunking uses LangChain's MarkdownTextSplitter (2000 chars, 200 overlap) from chunking.py
+# Search parameters
+SEARCH_DEFAULT_LIMIT = int(os.environ.get("SEARCH_DEFAULT_LIMIT", "10"))  # SERP results per page
+SEARCH_DEFAULT_TOP_K = int(os.environ.get("SEARCH_DEFAULT_TOP_K", "8"))   # Top chunks after reranking

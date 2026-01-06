@@ -9,13 +9,14 @@ import httpx
 from typing import Optional, AsyncGenerator
 
 from app.logging_config import logger
-from app.config import BRIGHTDATA_API_TOKEN
+from app.config import BRIGHTDATA_API_TOKEN, BRIGHTDATA_SB_WS_URL
 
 # Timeout for URL conversion (seconds)
 URL_CONVERSION_TIMEOUT = 30
 from app.core.cache import content_cache
-from app.scraping.utils import is_blocked_error
+from app.scraping.utils import is_blocked_error, is_social_media_url
 from app.scraping.brightdata import fetch_via_brightdata, md
+from app.core.cdp_queue import fetch_with_cdp  # Queue-based CDP processing
 from app.processing.chunking import split_markdown_into_paragraphs, create_smart_batches
 from app.services.conversion import run_sync_in_executor
 
@@ -23,8 +24,9 @@ from app.services.conversion import run_sync_in_executor
 async def stream_url_conversion(url: str, query: Optional[str] = None) -> AsyncGenerator[str, None]:
     """
     Convert URL to markdown and stream back as paragraphs.
-    Falls back to Bright Data Web Unlocker if direct fetch is blocked or content doesn't match query.
-    Uses content cache for repeated requests.
+    - Social media URLs go directly to CDP (BrightData Scraping Browser)
+    - Other URLs use MarkItDown with fallback to Web Unlocker/CDP
+    - Relevance checking is handled by deep_search.py, not here
     """
     try:
         logger.info("stream_url_conversion_start", url=url, query=query)
@@ -42,46 +44,85 @@ async def stream_url_conversion(url: str, query: Optional[str] = None) -> AsyncG
                 logger.info("stream_url_conversion_cache_hit", url=url)
 
         if not markdown:
-            # Try MarkItDown first (run in executor to avoid blocking event loop)
-            try:
-                # Add timeout to prevent hanging on slow sites
-                result = await asyncio.wait_for(
-                    run_sync_in_executor(md.convert_url, url),
-                    timeout=URL_CONVERSION_TIMEOUT
-                )
-                markdown = result.markdown
-                logger.info("stream_url_conversion_markitdown", url=url)
+            # For social media URLs, skip MarkItDown and go straight to CDP
+            if is_social_media_url(url) and BRIGHTDATA_SB_WS_URL:
+                logger.info("stream_url_conversion_cdp_direct", url=url)
+                try:
+                    markdown = await fetch_with_cdp(url)
+                    used_brightdata = True
+                    logger.info("stream_url_conversion_cdp_direct_success", url=url, content_len=len(markdown) if markdown else 0)
+                except Exception as cdp_error:
+                    logger.error("stream_url_conversion_cdp_direct_failed", url=url, error=str(cdp_error))
+                    raise cdp_error
 
-                # Note: Smart JS detection for SPA pages is now handled by deep_search.py
-                # using semantic search (Jina reranker) instead of keyword matching.
-                # This streaming endpoint provides basic URL conversion only.
+            # Try MarkItDown for non-social media URLs
+            else:
+                try:
+                    # Add timeout to prevent hanging on slow sites
+                    result = await asyncio.wait_for(
+                        run_sync_in_executor(md.convert_url, url),
+                        timeout=URL_CONVERSION_TIMEOUT
+                    )
+                    markdown = result.markdown
+                    logger.info("stream_url_conversion_markitdown", url=url)
 
-            except asyncio.TimeoutError:
-                logger.warning("stream_url_conversion_timeout", url=url, timeout=URL_CONVERSION_TIMEOUT)
-                raise Exception(f"URL conversion timed out after {URL_CONVERSION_TIMEOUT}s")
-            except Exception as e:
-                # Check if this is a blocking error (403, captcha, etc.)
-                # Use Web Unlocker for blocked requests, Scraping Browser for SPA fallback
-                if is_blocked_error(e) and BRIGHTDATA_API_TOKEN:
-                    logger.warning("stream_url_conversion_blocked", url=url, error=str(e))
-                    try:
-                        markdown = await fetch_via_brightdata(url)
-                        used_brightdata = True
-                        logger.info("stream_url_conversion_web_unlocker", url=url)
-                    except Exception as bd_error:
-                        # Bright Data also failed, raise the original error
-                        logger.error("stream_url_conversion_brightdata_failed", url=url, error=str(bd_error))
+                except asyncio.TimeoutError:
+                    logger.warning("stream_url_conversion_timeout", url=url, timeout=URL_CONVERSION_TIMEOUT)
+                    # Try CDP for timeouts
+                    if BRIGHTDATA_SB_WS_URL:
+                        logger.info("stream_url_conversion_cdp_fallback_timeout", url=url)
+                        try:
+                            markdown = await fetch_with_cdp(url)
+                            used_brightdata = True
+                            logger.info("stream_url_conversion_cdp_success", url=url)
+                        except Exception as cdp_error:
+                            logger.error("stream_url_conversion_cdp_failed", url=url, error=str(cdp_error))
+                            raise Exception(f"URL conversion timed out after {URL_CONVERSION_TIMEOUT}s")
+                    else:
+                        raise Exception(f"URL conversion timed out after {URL_CONVERSION_TIMEOUT}s")
+
+                except Exception as e:
+                    # Check if this is a blocking error (403, captcha, etc.)
+                    if is_blocked_error(e) and BRIGHTDATA_API_TOKEN:
+                        logger.warning("stream_url_conversion_blocked", url=url, error=str(e))
+                        try:
+                            markdown = await fetch_via_brightdata(url)
+                            used_brightdata = True
+                            logger.info("stream_url_conversion_web_unlocker", url=url)
+                        except Exception as bd_error:
+                            logger.error("stream_url_conversion_brightdata_failed", url=url, error=str(bd_error))
+                            # Web Unlocker failed - try CDP as last resort
+                            if BRIGHTDATA_SB_WS_URL:
+                                logger.info("stream_url_conversion_cdp_fallback", url=url)
+                                try:
+                                    markdown = await fetch_with_cdp(url)
+                                    used_brightdata = True
+                                    logger.info("stream_url_conversion_cdp_success", url=url)
+                                except Exception as cdp_error:
+                                    logger.error("stream_url_conversion_cdp_failed", url=url, error=str(cdp_error))
+                                    raise e
+                            else:
+                                raise e
+                    elif BRIGHTDATA_SB_WS_URL:
+                        # Not a typical blocking error but maybe an auth wall - try CDP
+                        logger.info("stream_url_conversion_cdp_fallback_auth", url=url, error=str(e))
+                        try:
+                            markdown = await fetch_with_cdp(url)
+                            used_brightdata = True
+                            logger.info("stream_url_conversion_cdp_success", url=url)
+                        except Exception as cdp_error:
+                            logger.error("stream_url_conversion_cdp_failed", url=url, error=str(cdp_error))
+                            raise e
+                    else:
                         raise e
-                else:
-                    # Not a blocking error or no Bright Data token, re-raise
-                    raise e
 
             # Cache the result if caching is enabled
             if content_cache and markdown:
                 content_cache.set(url, markdown, query)
 
+        # Check for empty content
         if not markdown or not markdown.strip():
-            yield json.dumps({"type": "error", "error": "No content extracted from URL"}) + "\n"
+            yield json.dumps({"type": "error", "message": "No content extracted from URL"}) + "\n"
             return
 
         # Split into paragraphs/chunks

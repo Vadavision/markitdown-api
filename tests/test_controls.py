@@ -38,7 +38,7 @@ def mock_markitdown():
 def mock_brightdata():
     """Mock Bright Data fetch functions."""
     with patch('api.fetch_via_brightdata') as mock_unlocker, \
-         patch('api.fetch_with_js_rendering') as mock_cdp:
+         patch('api.fetch_with_cdp') as mock_cdp:
         yield {
             'unlocker': mock_unlocker,
             'cdp': mock_cdp
